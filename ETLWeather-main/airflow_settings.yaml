@@ -1,0 +1,14 @@
+# Local-dev only. Imported by `astro dev start` / `astro dev object import`.
+airflow:
+  connections:
+    - conn_id: open_meteo_api
+      conn_type: http
+      conn_host: https://api.open-meteo.com
+    # Astro's own metadata Postgres (service name `postgres` on the compose network).
+    - conn_id: postgres_default
+      conn_type: postgres
+      conn_host: postgres
+      conn_schema: postgres
+      conn_login: postgres
+      conn_password: postgres
+      conn_port: 5432

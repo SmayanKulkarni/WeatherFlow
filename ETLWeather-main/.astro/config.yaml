@@ -1,0 +1,4 @@
+project:
+  name: etlweather
+postgres:
+  port: "5433"
