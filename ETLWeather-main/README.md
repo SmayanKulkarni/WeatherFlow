@@ -1,48 +1,116 @@
-Overview
-========
+# ETLWeather
 
-Welcome to Astronomer! This project was generated after you ran 'astro dev init' using the Astronomer CLI. This readme describes the contents of the project, as well as how to run Apache Airflow on your local machine.
+An Apache Airflow ETL pipeline, built on the Astronomer Astro CLI, that pulls the current weather for a location from the [Open-Meteo](https://open-meteo.com) API and stores each reading in PostgreSQL.
 
-Project Contents
-================
+## What it does
 
-Your Astro project contains the following files and folders:
+The `weather_etl_pipeline` DAG runs `@daily`. Each run:
 
-- dags: This folder contains the Python files for your Airflow DAGs. By default, this directory includes one example DAG:
-    - `example_astronauts`: This DAG shows a simple ETL pipeline example that queries the list of astronauts currently in space from the Open Notify API and prints a statement for each astronaut. The DAG uses the TaskFlow API to define tasks in Python, and dynamic task mapping to dynamically print a statement for each astronaut. For more on how this DAG works, see our [Getting started tutorial](https://www.astronomer.io/docs/learn/get-started-with-airflow).
-- Dockerfile: This file contains a versioned Astro Runtime Docker image that provides a differentiated Airflow experience. If you want to execute other commands or overrides at runtime, specify them here.
-- include: This folder contains any additional files that you want to include as part of your project. It is empty by default.
-- packages.txt: Install OS-level packages needed for your project by adding them to this file. It is empty by default.
-- requirements.txt: Install Python packages needed for your project by adding them to this file. It is empty by default.
-- plugins: Add custom or community plugins for your project to this file. It is empty by default.
-- airflow_settings.yaml: Use this local-only file to specify Airflow Connections, Variables, and Pools instead of entering them in the Airflow UI as you develop DAGs in this project.
+1. Creates the `weather_data` table if it doesn't exist.
+2. Fetches current conditions for a latitude/longitude (default: London) from Open-Meteo.
+3. Reshapes the response into a flat record.
+4. Rejects implausible readings.
+5. Inserts the record into Postgres, skipping duplicates.
 
-Deploy Your Project Locally
-===========================
+No API key is needed. Open-Meteo's free tier is open for non-commercial use, so the `open_meteo_api` connection only holds the host URL.
 
-1. Start Airflow on your local machine by running 'astro dev start'.
+## Architecture
 
-This command will spin up 4 Docker containers on your machine, each for a different Airflow component:
+```mermaid
+flowchart LR
+    subgraph Airflow["Airflow DAG: weather_etl_pipeline"]
+        direction LR
+        C[create_table] --> L
+        E[extract_weather_data] --> T[transform_weather_data] --> V[validate_weather_data] --> L[load_weather_data]
+    end
+    API[(Open-Meteo<br/>api.open-meteo.com)] -- "GET /v1/forecast<br/>HttpHook, conn: open_meteo_api" --> E
+    L -- "INSERT ... ON CONFLICT DO NOTHING<br/>PostgresHook, conn: postgres_default" --> DB[(PostgreSQL<br/>weather_data)]
+```
 
-- Postgres: Airflow's Metadata Database
-- Webserver: The Airflow component responsible for rendering the Airflow UI
-- Scheduler: The Airflow component responsible for monitoring and triggering tasks
-- Triggerer: The Airflow component responsible for triggering deferred tasks
+| Task | Type | Role |
+|------|------|------|
+| `create_table` | `SQLExecuteQueryOperator` | Idempotent `CREATE TABLE IF NOT EXISTS weather_data` |
+| `extract_weather_data` | TaskFlow `@task` + `HttpHook` | `GET /v1/forecast?current_weather=true` for the configured coordinates |
+| `transform_weather_data` | TaskFlow `@task` | Flattens `current_weather` into one row (temperature, windspeed, winddirection, weathercode, observed_at) |
+| `validate_weather_data` | TaskFlow `@task` | Raises `AirflowFailException` (no retry) if temperature is missing or outside -90..60 °C |
+| `load_weather_data` | TaskFlow `@task` + `PostgresHook` | Parameterized insert; runs after both `create_table` and validation |
 
-2. Verify that all 4 Docker containers were created by running 'docker ps'.
+### Design notes
 
-Note: Running 'astro dev start' will start your project with the Airflow Webserver exposed at port 8080 and Postgres exposed at port 5432. If you already have either of those ports allocated, you can either [stop your existing Docker containers or change the port](https://www.astronomer.io/docs/astro/cli/troubleshoot-locally#ports-are-not-available-for-my-local-airflow-webserver).
+- **Connections, not hardcoded hosts.** The API and database are reached through Airflow connections (`open_meteo_api`, `postgres_default`), so credentials and URLs live outside the DAG code.
+- **Idempotent loads.** `weather_data` has `UNIQUE (latitude, longitude, observed_at)` and the insert uses `ON CONFLICT DO NOTHING`, so re-runs within the same API reading don't create duplicates.
+- **Fail fast on bad data.** Validation failures use `AirflowFailException`, so they skip the default 2 retries (5 min apart) that cover transient API errors.
+- **Runtime parameters.** `latitude` and `longitude` are validated `Param`s (range-checked). Override them via *Trigger DAG w/ config* in the UI.
+- **`catchup=False`.** The API returns current conditions only, so backfilling past dates would just store today's reading repeatedly.
 
-3. Access the Airflow UI for your local Airflow project. To do so, go to http://localhost:8080/ and log in with 'admin' for both your Username and Password.
+### Table schema
 
-You should also be able to access your Postgres Database at 'localhost:5432/postgres'.
+```sql
+weather_data (
+    latitude FLOAT, longitude FLOAT,
+    temperature FLOAT, windspeed FLOAT, winddirection FLOAT, weathercode INT,
+    observed_at TIMESTAMP,                    -- time of the reading, from the API
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,  -- time of insertion
+    UNIQUE (latitude, longitude, observed_at)
+)
+```
 
-Deploy Your Project to Astronomer
-=================================
+## Project layout
 
-If you have an Astronomer account, pushing code to a Deployment on Astronomer is simple. For deploying instructions, refer to Astronomer documentation: https://www.astronomer.io/docs/astro/deploy-code/
+```
+.
+├── dags/etlweather.py          # the weather_etl_pipeline DAG
+├── tests/dags/
+│   ├── test_etlweather.py      # structure, transform, validation, load (mocked hooks)
+│   └── test_dag_example.py     # generic DAG import/integrity checks
+├── airflow_settings.yaml       # local-only connections (open_meteo_api, postgres_default)
+├── Dockerfile                  # Astro Runtime 13.12.2
+├── requirements.txt            # extra Python deps (none needed beyond the runtime)
+├── packages.txt                # OS-level packages (none)
+└── .astro/config.yaml          # Astro project config (Postgres exposed on 5433)
+```
 
-Contact
-=======
+## Running locally
 
-The Astronomer CLI is maintained with love by the Astronomer team. To report a bug or suggest a change, reach out to our support.
+Prerequisites: Docker and the [Astro CLI](https://www.astronomer.io/docs/astro/cli/install-cli).
+
+```bash
+astro dev start
+```
+
+This starts the Airflow scheduler, webserver, triggerer and a Postgres container, and imports the connections from `airflow_settings.yaml`.
+
+- Airflow UI: http://localhost:8080 (user `admin`, password `admin`)
+- Postgres: `localhost:5433`, database `postgres`, user/password `postgres`
+
+Then unpause `weather_etl_pipeline` and trigger it. Check the result:
+
+```bash
+psql -h localhost -p 5433 -U postgres -c "SELECT * FROM weather_data ORDER BY timestamp DESC LIMIT 5;"
+```
+
+### Different location
+
+Use *Trigger DAG w/ config* and set, for example:
+
+```json
+{ "latitude": 40.7128, "longitude": -74.0060 }
+```
+
+## Testing
+
+```bash
+astro dev pytest tests/
+```
+
+The tests cover DAG structure and dependencies, parameter bounds, the transform, validation failures, and the load query. Hooks are mocked, so no network or database is needed.
+
+## Deploying
+
+The `airflow_settings.yaml` connections are for local development only. On Astro or another Airflow deployment, create the `open_meteo_api` (HTTP, host `https://api.open-meteo.com`) and `postgres_default` connections through the UI, environment variables or a secrets backend. See the [Astronomer deploy docs](https://www.astronomer.io/docs/astro/deploy-code/).
+
+If you later use Open-Meteo commercially, buy a plan and send the key as an `apikey` query parameter against `customer-api.open-meteo.com`.
+
+## License
+
+See [LICENSE](LICENSE).
